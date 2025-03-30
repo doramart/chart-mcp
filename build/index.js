@@ -175,7 +175,7 @@ server.tool("add", { a: z.number(), b: z.number() }, async ({ a, b }) => ({
     content: [{ type: "text", text: String(a + b) }],
 }));
 // Multiplication tool
-server.tool("multiply123", { a: z.number(), b: z.number() }, async ({ a, b }) => ({
+server.tool("multiply", { a: z.number(), b: z.number() }, async ({ a, b }) => ({
     content: [{ type: "text", text: String(a * b) }],
 }));
 // Division tool
