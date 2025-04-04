@@ -1,257 +1,197 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import {
+  McpServer,
+  ResourceTemplate,
+} from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { DataLoader, LoadedData } from "./data/loader.js";
+import { ChartGenerator } from "./data/chart.js";
+import * as dotenv from "dotenv";
+import * as fs from "fs/promises";
+import * as path from "path";
+import { Base64 } from "js-base64";
+// 加载环境变量
+dotenv.config();
 
-const NWS_API_BASE = "https://api.chart.gov";
-const USER_AGENT = "chart-app/1.0";
+// 验证必要的环境变量
+const requiredEnvVars = ["UPLOAD_DIR", "API_KEY", "BASE_URL", "AI_MODEL"];
+const missingEnvVars = requiredEnvVars.filter(
+  (varName) => !process.env[varName]
+);
+if (missingEnvVars.length > 0) {
+  throw new Error(
+    `Missing required environment variables: ${missingEnvVars.join(", ")}`
+  );
+}
 
-// Helper function for making NWS API requests
-async function makeNWSRequest<T>(url: string): Promise<T | null> {
-  const headers = {
-    "User-Agent": USER_AGENT,
-    Accept: "application/geo+json",
-  };
+class ChartMCPServer {
+  private server: McpServer;
+  private dataLoader: DataLoader;
+  private chartGenerator: ChartGenerator;
+  private readonly uploadDir: string;
 
-  try {
-    const response = await fetch(url, { headers });
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
+  constructor() {
+    // 验证并规范化上传目录路径
+    this.uploadDir = path.resolve(process.env.UPLOAD_DIR!);
+
+    this.server = new McpServer({
+      name: "Chart MCP Server",
+      version: "1.0.0",
+    });
+
+    this.dataLoader = new DataLoader(this.uploadDir);
+    this.chartGenerator = new ChartGenerator();
+
+    this.registerResources();
+    this.registerTools();
+  }
+
+  private async ensureUploadDir(): Promise<void> {
+    try {
+      await fs.access(this.uploadDir);
+    } catch (error) {
+      await fs.mkdir(this.uploadDir, { recursive: true });
     }
-    return (await response.json()) as T;
-  } catch (error) {
-    console.error("Error making NWS request:", error);
-    return null;
+  }
+
+  private registerResources() {
+    // 注册文件资源
+    this.server.resource(
+      "data-file",
+      new ResourceTemplate("data://{filename}", { list: undefined }),
+      async (uri, { filename }) => {
+        try {
+          // 验证文件名
+          const actualFilename = Array.isArray(filename)
+            ? filename[0]
+            : filename;
+          if (!actualFilename || actualFilename.includes("..")) {
+            throw new Error("Invalid filename");
+          }
+
+          const filePath = path.join(this.uploadDir, actualFilename);
+
+          // 确保文件存在且可读
+          const fileStat = await fs.stat(filePath);
+          if (!fileStat.isFile()) {
+            throw new Error("Not a valid file");
+          }
+
+          // 加载并验证数据
+          const data: LoadedData = await this.dataLoader.loadFile(filePath);
+
+          return {
+            contents: [
+              {
+                uri: uri.href,
+                text: JSON.stringify(data),
+              },
+            ],
+          };
+        } catch (error: any) {
+          throw new Error(`Failed to load file: ${error.message}`);
+        }
+      }
+    );
+  }
+
+  private registerTools() {
+    // Remove test tool if exists
+    // Only keep the generate_chart tool
+
+    // 图表生成工具
+    this.server.tool(
+      "generate_chart",
+      {
+        dataResource: z
+          .string()
+          .url("Invalid data resource URL")
+          .refine((val) => val.startsWith("data://"), {
+            message: "Data resource must start with 'data://'",
+          })
+          .describe("数据资源的URI，格式为 data://{filename}"),
+        prompt: z
+          .string()
+          .min(1, "Prompt cannot be empty")
+          .max(1000, "Prompt is too long")
+          .describe(
+            "用户的需求描述，用于指导图表生成，例如：'展示销售额随月份的变化趋势'"
+          ),
+      },
+      async ({ dataResource, prompt }) => {
+        try {
+          // 解析和验证数据资源 URL
+          const resourceUrl = new URL(dataResource);
+          if (resourceUrl.protocol !== "data:") {
+            throw new Error("Invalid data resource protocol");
+          }
+
+          const fileName = resourceUrl.hostname; // 获取文件名
+          if (!fileName || fileName.includes("..")) {
+            throw new Error("Invalid filename in data resource");
+          }
+
+          const filePath = path.join(this.uploadDir, fileName);
+
+          // 验证文件存在性和权限
+          await fs.access(filePath, fs.constants.R_OK);
+          const fileStat = await fs.stat(filePath);
+          if (!fileStat.isFile()) {
+            throw new Error("Resource is not a valid file");
+          }
+
+          // 加载数据并生成图表
+          const data = await this.dataLoader.loadFile(filePath);
+          const chartOption = await this.chartGenerator.generateChart(
+            data,
+            prompt
+          );
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: `https://chart.micoai.cn/v1/page?options=${Base64.encode(
+                  JSON.stringify(chartOption)
+                )}`,
+              },
+            ],
+          };
+        } catch (error: any) {
+          console.error("Chart generation error:", error);
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Error generating chart: ${error.message}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+    );
+  }
+
+  async start() {
+    try {
+      // 确保上传目录存在
+      await this.ensureUploadDir();
+
+      const transport = new StdioServerTransport();
+      await this.server.connect(transport);
+
+      console.log("Chart MCP Server started successfully");
+    } catch (error: any) {
+      console.error("Failed to start server:", error);
+      process.exit(1);
+    }
   }
 }
 
-interface AlertFeature {
-  properties: {
-    event?: string;
-    areaDesc?: string;
-    severity?: string;
-    status?: string;
-    headline?: string;
-  };
-}
-
-// Format alert data
-function formatAlert(feature: AlertFeature): string {
-  const props = feature.properties;
-  return [
-    `Event: ${props.event || "Unknown"}`,
-    `Area: ${props.areaDesc || "Unknown"}`,
-    `Severity: ${props.severity || "Unknown"}`,
-    `Status: ${props.status || "Unknown"}`,
-    `Headline: ${props.headline || "No headline"}`,
-    "---",
-  ].join("\n");
-}
-
-interface ForecastPeriod {
-  name?: string;
-  temperature?: number;
-  temperatureUnit?: string;
-  windSpeed?: string;
-  windDirection?: string;
-  shortForecast?: string;
-}
-
-interface AlertsResponse {
-  features: AlertFeature[];
-}
-
-interface PointsResponse {
-  properties: {
-    forecast?: string;
-  };
-}
-
-interface ForecastResponse {
-  properties: {
-    periods: ForecastPeriod[];
-  };
-}
-
-// Create server instance
-const server = new McpServer({
-  name: "chart",
-  version: "1.0.0",
-});
-
-// // Register chart tools
-// server.tool(
-//   "get-alerts",
-//   "Get chart alerts for a state",
-//   {
-//     state: z.string().length(2).describe("Two-letter state code (e.g. CA, NY)"),
-//   },
-//   async ({ state }) => {
-//     const stateCode = state.toUpperCase();
-//     const alertsUrl = `${NWS_API_BASE}/alerts?area=${stateCode}`;
-//     const alertsData = await makeNWSRequest<AlertsResponse>(alertsUrl);
-
-//     if (!alertsData) {
-//       return {
-//         content: [
-//           {
-//             type: "text",
-//             text: "Failed to retrieve alerts data",
-//           },
-//         ],
-//       };
-//     }
-
-//     const features = alertsData.features || [];
-//     if (features.length === 0) {
-//       return {
-//         content: [
-//           {
-//             type: "text",
-//             text: `No active alerts for ${stateCode}`,
-//           },
-//         ],
-//       };
-//     }
-
-//     const formattedAlerts = features.map(formatAlert);
-//     const alertsText = `Active alerts for ${stateCode}:\n\n${formattedAlerts.join(
-//       "\n"
-//     )}`;
-
-//     return {
-//       content: [
-//         {
-//           type: "text",
-//           text: alertsText,
-//         },
-//       ],
-//     };
-//   }
-// );
-
-// server.tool(
-//   "get-forecast",
-//   "Get chart forecast for a location",
-//   {
-//     latitude: z.number().min(-90).max(90).describe("Latitude of the location"),
-//     longitude: z
-//       .number()
-//       .min(-180)
-//       .max(180)
-//       .describe("Longitude of the location"),
-//   },
-//   async ({ latitude, longitude }) => {
-//     // Get grid point data
-//     const pointsUrl = `${NWS_API_BASE}/points/${latitude.toFixed(
-//       4
-//     )},${longitude.toFixed(4)}`;
-//     const pointsData = await makeNWSRequest<PointsResponse>(pointsUrl);
-
-//     if (!pointsData) {
-//       return {
-//         content: [
-//           {
-//             type: "text",
-//             text: `Failed to retrieve grid point data for coordinates: ${latitude}, ${longitude}. This location may not be supported by the NWS API (only US locations are supported).`,
-//           },
-//         ],
-//       };
-//     }
-
-//     const forecastUrl = pointsData.properties?.forecast;
-//     if (!forecastUrl) {
-//       return {
-//         content: [
-//           {
-//             type: "text",
-//             text: "Failed to get forecast URL from grid point data",
-//           },
-//         ],
-//       };
-//     }
-
-//     // Get forecast data
-//     const forecastData = await makeNWSRequest<ForecastResponse>(forecastUrl);
-//     if (!forecastData) {
-//       return {
-//         content: [
-//           {
-//             type: "text",
-//             text: "Failed to retrieve forecast data",
-//           },
-//         ],
-//       };
-//     }
-
-//     const periods = forecastData.properties?.periods || [];
-//     if (periods.length === 0) {
-//       return {
-//         content: [
-//           {
-//             type: "text",
-//             text: "No forecast periods available",
-//           },
-//         ],
-//       };
-//     }
-
-//     // Format forecast periods
-//     const formattedForecast = periods.map((period: ForecastPeriod) =>
-//       [
-//         `${period.name || "Unknown"}:`,
-//         `Temperature: ${period.temperature || "Unknown"}°${
-//           period.temperatureUnit || "F"
-//         }`,
-//         `Wind: ${period.windSpeed || "Unknown"} ${period.windDirection || ""}`,
-//         `${period.shortForecast || "No forecast available"}`,
-//         "---",
-//       ].join("\n")
-//     );
-
-//     const forecastText = `Forecast for ${latitude}, ${longitude}:\n\n${formattedForecast.join(
-//       "\n"
-//     )}`;
-
-//     return {
-//       content: [
-//         {
-//           type: "text",
-//           text: forecastText,
-//         },
-//       ],
-//     };
-//   }
-// );
-// Add an addition tool
-server.tool("add", { a: z.number(), b: z.number() }, async ({ a, b }) => ({
-  content: [{ type: "text", text: String(a + b) }],
-}));
-
-// Multiplication tool
-server.tool("multiply", { a: z.number(), b: z.number() }, async ({ a, b }) => ({
-  content: [{ type: "text", text: String(a * b) }],
-}));
-
-// Division tool
-server.tool("divide", { a: z.number(), b: z.number() }, async ({ a, b }) => {
-  if (b === 0) {
-    return {
-      content: [{ type: "text", text: "Error: Cannot divide by zero" }],
-    };
-  }
-  return {
-    content: [{ type: "text", text: String(a / b) }],
-  };
-});
-
-// Start the server
-async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error("Chart MCP Server running on stdio");
-}
-
-main().catch((error) => {
-  console.error("Fatal error in main():", error);
+// 启动服务器
+const server = new ChartMCPServer();
+server.start().catch((error) => {
+  console.error("Server error:", error);
   process.exit(1);
 });

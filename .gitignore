@@ -1,2 +1,25 @@
-node_modules
-.history
+# Dependencies
+node_modules/
+package-lock.json
+
+# Build output
+build/
+
+# Environment variables
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Uploads
+uploads/
+
+# OS
+.DS_Store
+Thumbs.db
+.history/
+*.bk
